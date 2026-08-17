@@ -159,11 +159,24 @@ class RawMJPEGCamera:
     """
 
     def __init__(self, device="/dev/video0", width=640, height=400, fps=120,
-                 logger=None):
+                 exposure=None, gain=None, auto_exposure=False, logger=None):
+        """
+        exposure : manual exposure time in device units (v4l2
+                   exposure_time_absolute, typically 100us steps). None leaves
+                   it alone. For lightning use MANUAL exposure so brightness is
+                   stable frame-to-frame (auto-exposure pumps and ruins motion
+                   analysis).
+        gain     : manual analog gain. None leaves it alone.
+        auto_exposure : if False (default), disable auto-exposure so your
+                   manual exposure/gain stick.
+        """
         self.device = device
         self.width = width
         self.height = height
         self.fps = fps
+        self.exposure = exposure
+        self.gain = gain
+        self.auto_exposure = auto_exposure
         self.log = logger
         self._dev = None
         self._cap = None          # VideoCapture context
@@ -186,6 +199,39 @@ class RawMJPEGCamera:
             return int(d.replace("/dev/video", ""))
         return int(d)
 
+    def _apply_controls(self):
+        """
+        Set manual exposure/gain via v4l2 controls. Uses v4l2-ctl as the
+        portable path (control names vary by driver). Best-effort: logs what it
+        set and never raises.
+        """
+        import subprocess
+        cmds = []
+        # Turn OFF auto-exposure first (value 1 = manual mode in V4L2's
+        # exposure_auto menu; drivers differ, so we try both common names).
+        if not self.auto_exposure:
+            cmds.append(("exposure_auto", 1))
+            cmds.append(("auto_exposure", 1))
+        if self.exposure is not None:
+            cmds.append(("exposure_time_absolute", self.exposure))
+            cmds.append(("exposure_absolute", self.exposure))
+        if self.gain is not None:
+            cmds.append(("gain", self.gain))
+        for name, val in cmds:
+            try:
+                subprocess.run(
+                    ["v4l2-ctl", "-d", self.device if isinstance(self.device, str)
+                     else f"/dev/video{self.device}",
+                     "--set-ctrl", f"{name}={val}"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=3)
+            except Exception:
+                pass
+        if self.log and (self.exposure is not None or self.gain is not None):
+            self.log.info("Applied manual controls: exposure=%s gain=%s "
+                          "auto_exposure=%s", self.exposure, self.gain,
+                          self.auto_exposure)
+
     def open(self) -> bool:
         if not self.available:
             return False
@@ -199,6 +245,8 @@ class RawMJPEGCamera:
             self._dev.set_fps(lv.BufferType.VIDEO_CAPTURE, self.fps)
         except Exception:
             pass
+        # apply manual exposure/gain BEFORE streaming so the first frames obey
+        self._apply_controls()
         # start streaming via a VideoCapture context we hold open
         self._cap = lv.VideoCapture(self._dev)
         self._cap.open()                     # begins streaming
