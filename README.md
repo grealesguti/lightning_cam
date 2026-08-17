@@ -36,22 +36,73 @@ on the USB drive.
 
 ## 2. Install (on the Raspberry Pi)
 
+Recent Raspberry Pi OS (Bookworm) is **externally managed** — system-wide
+`pip3 install` is blocked (`error: externally-managed-environment`). Use a
+virtual environment. This is the recommended path:
+
 ```bash
+cd ~/lightning_cam
+
+# system packages + V4L tools
 sudo apt update
-sudo apt install -y python3-pip v4l-utils
-pip3 install opencv-python numpy spidev RPi.GPIO
-# I²C alternative for the sensor:
-pip3 install smbus2
+sudo apt install -y python3-full python3-venv v4l-utils
+
+# venv that can still fall back to system-provided modules (RPi.GPIO etc.)
+python3 -m venv --system-site-packages venv
+source venv/bin/activate
+
+pip install --upgrade pip
+pip install opencv-python numpy spidev lgpio smbus2
 ```
 
-Enable the buses you use:
+**GPIO on Bookworm:** the sensor uses **`lgpio`**, which talks to the modern
+`gpiochip` character device. The older `RPi.GPIO` library relies on the sysfs
+interface that Bookworm removed, so its edge detection fails with
+`RuntimeError: Failed to add edge detection`. `lgpio` is the correct choice on
+current Pi OS; the driver falls back to `RPi.GPIO` automatically on older
+systems if `lgpio` isn't present. If apt provides it, `sudo apt install -y
+python3-lgpio` also works.
+
+The `--system-site-packages` flag matters on the Pi: some libraries (parts of
+the camera stack, sometimes `lgpio`) already ship via apt, and this lets the
+venv use them if a pip wheel is troublesome.
+
+> **`opencv-python` slow or failing to build on a Pi 3B+?** Use the
+> precompiled apt build instead — it's ARM-native and generally faster:
+> ```bash
+> deactivate
+> sudo apt install -y python3-opencv
+> cd ~/lightning_cam && rm -rf venv
+> python3 -m venv --system-site-packages venv   # inherits system cv2
+> source venv/bin/activate
+> pip install numpy spidev RPi.GPIO smbus2       # cv2 comes from system
+> python -c "import cv2; print('cv2', cv2.__version__)"
+> ```
+
+**Every session, activate the venv before running anything:**
+
+```bash
+cd ~/lightning_cam
+source venv/bin/activate
+python tests/test_camera.py --list
+```
+
+*(If you deliberately want a system-wide install instead of a venv, you can
+append `--break-system-packages` to `pip3 install`, at the documented risk of
+disturbing OS Python packages. The venv above is safer.)*
+
+### Enable the buses
 
 ```bash
 sudo raspi-config    # Interface Options → enable SPI (and/or I2C)
-# verify:
-ls /dev/spidev*      # e.g. /dev/spidev0.0
+# verify (SPI CE0/CE1 and the I2C buses should appear):
+ls /dev/spidev*      # e.g. /dev/spidev0.0  /dev/spidev0.1
 ls /dev/i2c*         # e.g. /dev/i2c-1
 ```
+
+`spidev0.0` is chip-select **CE0** (`--spi-dev 0`), `spidev0.1` is **CE1**
+(`--spi-dev 1`) — make sure this matches which CE line your sensor CS is wired
+to.
 
 ---
 
