@@ -32,11 +32,24 @@ try:
 except Exception:
     _HAVE_SPIDEV = False
 
+# GPIO backend selection.
+# Bookworm (kernel 6.x) dropped the sysfs GPIO interface that RPi.GPIO relies
+# on, so RPi.GPIO's add_event_detect() fails with "Failed to add edge
+# detection". lgpio talks to the modern gpiochip character device and is the
+# correct library on current Pi OS. We prefer lgpio and fall back to RPi.GPIO
+# on older systems.
+_GPIO_BACKEND = None            # "lgpio" | "rpigpio" | None
 try:
-    import RPi.GPIO as GPIO
-    _HAVE_GPIO = True
+    import lgpio
+    _GPIO_BACKEND = "lgpio"
 except Exception:
-    _HAVE_GPIO = False
+    try:
+        import RPi.GPIO as GPIO
+        _GPIO_BACKEND = "rpigpio"
+    except Exception:
+        _GPIO_BACKEND = None
+
+_HAVE_GPIO = _GPIO_BACKEND is not None
 
 
 # AS3935 register / interrupt-reason constants
@@ -78,6 +91,10 @@ class AS3935Sensor:
         self._stop = threading.Event()
         self._last_registers = {}
 
+        # lgpio state (unused on the RPi.GPIO fallback)
+        self._lg_handle = None
+        self._lg_cb = None
+
         self.available = self._check_backend()
 
     # ------------------------------------------------------------------ #
@@ -93,7 +110,8 @@ class AS3935Sensor:
                 self._warn("smbus not installed -- `pip install smbus2`")
                 return False
         if not _HAVE_GPIO:
-            self._warn("RPi.GPIO not installed -- IRQ handling unavailable")
+            self._warn("No GPIO backend -- install lgpio (`pip install lgpio`, "
+                       "recommended on Bookworm) or RPi.GPIO. IRQ unavailable.")
             return False
         return True
 
@@ -195,6 +213,9 @@ class AS3935Sensor:
         """
         Open the bus, configure the chip, and begin listening for IRQs.
         `callback(event_dict)` is invoked on each interrupt.
+
+        Uses lgpio (gpiochip character device) on Bookworm, falling back to
+        RPi.GPIO on older systems.
         """
         if not self.available:
             raise RuntimeError("Sensor backend unavailable -- see warnings above.")
@@ -203,15 +224,62 @@ class AS3935Sensor:
         self._open()
         self.configure()
 
+        if _GPIO_BACKEND == "lgpio":
+            self._start_lgpio()
+        elif _GPIO_BACKEND == "rpigpio":
+            self._start_rpigpio()
+        else:
+            raise RuntimeError("No usable GPIO backend.")
+
+        if self.log:
+            self.log.info("AS3935 listening on GPIO%d (IRQ, backend=%s).",
+                          self.irq_gpio, _GPIO_BACKEND)
+
+    # --- lgpio backend (Bookworm / current Pi OS) -------------------------- #
+    def _start_lgpio(self):
+        # gpiochip0 is the main header bank on Pi 3/4; Pi 5 uses gpiochip4 for
+        # the 40-pin header. Try 0 first, then 4.
+        handle = None
+        last_err = None
+        for chip in (0, 4):
+            try:
+                handle = lgpio.gpiochip_open(chip)
+                break
+            except Exception as e:
+                last_err = e
+        if handle is None:
+            raise RuntimeError(f"Could not open a gpiochip: {last_err}")
+        self._lg_handle = handle
+
+        # claim IRQ line for rising-edge alerts, with a pull-down and small
+        # debounce so a single strike doesn't fire the callback repeatedly.
+        lgpio.gpio_claim_alert(self._lg_handle, self.irq_gpio,
+                               lgpio.RISING_EDGE, lgpio.SET_PULL_DOWN)
+        try:
+            lgpio.gpio_set_debounce_micros(self._lg_handle, self.irq_gpio, 5000)
+        except Exception:
+            pass  # older lgpio may lack this; harmless
+
+        # lgpio delivers alerts to a callback with this signature:
+        #   cb(chip, gpio, level, tick)
+        self._lg_cb = lgpio.callback(self._lg_handle, self.irq_gpio,
+                                     lgpio.RISING_EDGE, self._on_irq_lgpio)
+
+    def _on_irq_lgpio(self, _chip, _gpio, _level, _tick):
+        self._dispatch_irq()
+
+    # --- RPi.GPIO backend (older systems) --------------------------------- #
+    def _start_rpigpio(self):
         GPIO.setmode(GPIO.BCM)
         GPIO.setup(self.irq_gpio, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
-        # Rising edge: AS3935 IRQ is active-high.
         GPIO.add_event_detect(self.irq_gpio, GPIO.RISING,
-                              callback=self._on_irq, bouncetime=5)
-        if self.log:
-            self.log.info("AS3935 listening on GPIO%d (IRQ).", self.irq_gpio)
+                              callback=self._on_irq_rpigpio, bouncetime=5)
 
-    def _on_irq(self, _channel):
+    def _on_irq_rpigpio(self, _channel):
+        self._dispatch_irq()
+
+    # --- shared dispatch --------------------------------------------------- #
+    def _dispatch_irq(self):
         try:
             ev = self.read_event()
             if self._callback:
@@ -222,12 +290,24 @@ class AS3935Sensor:
 
     def stop(self):
         self._stop.set()
-        try:
-            if _HAVE_GPIO:
+        if _GPIO_BACKEND == "lgpio":
+            try:
+                if self._lg_cb is not None:
+                    self._lg_cb.cancel()
+            except Exception:
+                pass
+            try:
+                if self._lg_handle is not None:
+                    lgpio.gpio_free(self._lg_handle, self.irq_gpio)
+                    lgpio.gpiochip_close(self._lg_handle)
+            except Exception:
+                pass
+        elif _GPIO_BACKEND == "rpigpio":
+            try:
                 GPIO.remove_event_detect(self.irq_gpio)
                 GPIO.cleanup(self.irq_gpio)
-        except Exception:
-            pass
+            except Exception:
+                pass
         if self._spi:
             self._spi.close()
         if self.log:
