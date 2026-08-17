@@ -197,7 +197,7 @@ def bench_raw(device, w, h, fps, seconds, log):
     from lc_camera import RawMJPEGCamera
     cam = RawMJPEGCamera(device=device, width=w, height=h, fps=fps, logger=log)
     if not cam.available:
-        log.warning("Raw path unavailable (install with: pip install v4l2py).")
+        log.warning("Raw path unavailable (install with: pip install linuxpy).")
         return None
     if not cam.open():
         log.error("Raw camera open failed.")

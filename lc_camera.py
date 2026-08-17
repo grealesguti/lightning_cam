@@ -146,18 +146,16 @@ class RawMJPEGCamera:
     per-frame JPEG decode.
 
     Why: on a Pi 3B+, OpenCV's cap.read() decodes every frame on the CPU, which
-    caps you at ~50 fps at 640x400 even though the USB link delivers ~120 fps.
-    Storing the compressed JPEG bytes instead skips decode entirely -- you get
-    the full frame rate AND ~1/10th the RAM. Decode only the frames you keep,
-    at save/review time, with CameraV4L2.decode_jpeg().
+    caps you at ~50 fps at 640x400 even though the USB link delivers 120+ fps.
+    Storing the compressed JPEG bytes instead skips decode entirely -- measured
+    ~238 fps at 640x400 on a Pi 3B+ vs ~50 fps decoded. Decode only the frames
+    you keep, at save/review time, with CameraV4L2.decode_jpeg().
 
-    Implementation: uses the `v4l2py` pure-Python V4L2 binding if available
-    (pip install v4l2py). It memory-maps the driver buffers and hands you the
-    raw MJPEG bytes per frame. If v4l2py isn't installed, `.available` is False
-    and you should fall back to CameraV4L2.
+    Backend: `linuxpy.video` (the maintained successor to v4l2py). We drive the
+    streaming lifecycle explicitly via a VideoCapture context so start/stop is
+    clean and there is no teardown exception.
 
-    This is the recommended capture path for the always-on recorder when using
-    MJPG at 640x400.
+    If linuxpy isn't installed, `.available` is False -- fall back to CameraV4L2.
     """
 
     def __init__(self, device="/dev/video0", width=640, height=400, fps=120,
@@ -168,33 +166,43 @@ class RawMJPEGCamera:
         self.fps = fps
         self.log = logger
         self._dev = None
-        self._iter = None
+        self._cap = None          # VideoCapture context
+        self._frames = None       # frame iterator
         try:
-            import v4l2py  # noqa
-            self._v4l2py = v4l2py
+            import linuxpy.video.device as _lv
+            self._lv = _lv
             self.available = True
         except Exception:
-            self._v4l2py = None
+            self._lv = None
             self.available = False
             if logger:
-                logger.warning("v4l2py not installed -- raw MJPEG capture "
-                               "unavailable. `pip install v4l2py` to enable the "
-                               "fast path; falling back to CameraV4L2 otherwise.")
+                logger.warning("linuxpy not installed -- raw MJPEG capture "
+                               "unavailable. `pip install linuxpy` to enable "
+                               "the fast path; falling back to CameraV4L2.")
+
+    def _dev_id(self):
+        d = self.device
+        if isinstance(d, str) and d.startswith("/dev/video"):
+            return int(d.replace("/dev/video", ""))
+        return int(d)
 
     def open(self) -> bool:
         if not self.available:
             return False
-        from v4l2py.device import Device, BufferType, PixelFormat
-        self._dev = Device(self.device)
+        lv = self._lv
+        self._dev = lv.Device.from_id(self._dev_id())
         self._dev.open()
-        # Configure MJPEG at the requested geometry/rate.
-        self._dev.set_format(BufferType.VIDEO_CAPTURE, self.width, self.height,
-                             PixelFormat.MJPEG)
+        # request MJPEG at the desired geometry
+        self._dev.set_format(lv.BufferType.VIDEO_CAPTURE,
+                             self.width, self.height, lv.PixelFormat.MJPEG)
         try:
-            self._dev.set_fps(BufferType.VIDEO_CAPTURE, self.fps)
+            self._dev.set_fps(lv.BufferType.VIDEO_CAPTURE, self.fps)
         except Exception:
             pass
-        self._iter = iter(self._dev)
+        # start streaming via a VideoCapture context we hold open
+        self._cap = lv.VideoCapture(self._dev)
+        self._cap.open()                     # begins streaming
+        self._frames = iter(self._cap)
         if self.log:
             self.log.info("RawMJPEGCamera open: %dx%d MJPG @%d (raw, no decode).",
                           self.width, self.height, self.fps)
@@ -202,10 +210,10 @@ class RawMJPEGCamera:
 
     def read_raw(self):
         """Return (ok, jpeg_bytes) for one frame, without decoding."""
-        if self._iter is None:
+        if self._frames is None:
             return False, None
         try:
-            frame = next(self._iter)
+            frame = next(self._frames)
             return True, bytes(frame.data)
         except StopIteration:
             return False, None
@@ -215,7 +223,7 @@ class RawMJPEGCamera:
             return False, None
 
     def measure_fps(self, seconds=3.0) -> dict:
-        if self._iter is None:
+        if self._frames is None:
             return {"ok": False, "reason": "camera not open"}
         n, drops = 0, 0
         t0 = time.time()
@@ -230,13 +238,20 @@ class RawMJPEGCamera:
                 "fps": round(n / dt, 2) if dt else 0, "read_failures": drops}
 
     def close(self):
+        # order matters: stop the stream, then close the device
         try:
-            if self._dev:
+            if self._cap is not None:
+                self._cap.close()
+        except Exception:
+            pass
+        try:
+            if self._dev is not None:
                 self._dev.close()
         except Exception:
             pass
+        self._cap = None
+        self._frames = None
         self._dev = None
-        self._iter = None
 
 
 class RingBuffer:
