@@ -190,6 +190,49 @@ class AS3935Sensor:
         reg = self._read_reg(0x01) & 0x8F
         self._write_reg(0x01, reg | ((level & 0x07) << 4))
 
+    def set_watchdog_threshold(self, level: int):
+        """
+        Watchdog threshold, register 0x01 bits [3:0], range 0..15 (WDTH).
+        Higher = more immune to short interference spikes, but can start
+        rejecting real weak/distant strikes. Datasheet default is 2.
+        """
+        reg = self._read_reg(0x01) & 0xF0
+        self._write_reg(0x01, reg | (level & 0x0F))
+
+    def set_spike_rejection(self, level: int):
+        """
+        Spike rejection, register 0x02 bits [3:0], range 0..15 (SREJ).
+        Higher = better at rejecting man-made disturbers by validating the
+        lightning waveform shape more strictly, at the cost of sensitivity to
+        genuine distant strikes. Datasheet default is 2.
+        """
+        reg = self._read_reg(0x02) & 0xF0
+        self._write_reg(0x02, reg | (level & 0x0F))
+
+    def set_min_strikes(self, strikes: int):
+        """
+        Minimum number of lightning events before an interrupt fires,
+        register 0x02 bits [5:4]. Valid values map to 1, 5, 9, 16.
+        Higher suppresses isolated false triggers.
+        """
+        mapping = {1: 0b00, 5: 0b01, 9: 0b10, 16: 0b11}
+        code = mapping.get(strikes, 0b00)
+        reg = self._read_reg(0x02) & 0xCF
+        self._write_reg(0x02, reg | (code << 4))
+
+    def mask_disturbers(self, enable: bool):
+        """
+        Register 0x03 bit 5 (MASK_DIST). When enabled, disturber interrupts are
+        suppressed -- only real lightning (and noise) fire the IRQ. Recommended
+        for the always-on recorder so man-made interference doesn't spam events.
+        """
+        reg = self._read_reg(0x03)
+        if enable:
+            reg |= (1 << 5)
+        else:
+            reg &= ~(1 << 5)
+        self._write_reg(0x03, reg)
+
     # ------------------------------------------------------------------ #
     # event decoding
     # ------------------------------------------------------------------ #
