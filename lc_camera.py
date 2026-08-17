@@ -110,6 +110,13 @@ class CameraV4L2:
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         return ok, frame
 
+    @staticmethod
+    def decode_jpeg(jpeg_bytes, mono=True):
+        """Decode JPEG bytes (from the raw V4L2 capturer) into an image array."""
+        arr = np.frombuffer(jpeg_bytes, dtype=np.uint8)
+        flag = cv2.IMREAD_GRAYSCALE if mono else cv2.IMREAD_COLOR
+        return cv2.imdecode(arr, flag)
+
     def measure_fps(self, seconds=3.0) -> dict:
         """Grab frames for N seconds and report the real achieved FPS."""
         if not self.cap:
@@ -131,6 +138,105 @@ class CameraV4L2:
         if self.cap:
             self.cap.release()
             self.cap = None
+
+
+class RawMJPEGCamera:
+    """
+    Capture RAW (undecoded) MJPEG frames straight from V4L2, bypassing OpenCV's
+    per-frame JPEG decode.
+
+    Why: on a Pi 3B+, OpenCV's cap.read() decodes every frame on the CPU, which
+    caps you at ~50 fps at 640x400 even though the USB link delivers ~120 fps.
+    Storing the compressed JPEG bytes instead skips decode entirely -- you get
+    the full frame rate AND ~1/10th the RAM. Decode only the frames you keep,
+    at save/review time, with CameraV4L2.decode_jpeg().
+
+    Implementation: uses the `v4l2py` pure-Python V4L2 binding if available
+    (pip install v4l2py). It memory-maps the driver buffers and hands you the
+    raw MJPEG bytes per frame. If v4l2py isn't installed, `.available` is False
+    and you should fall back to CameraV4L2.
+
+    This is the recommended capture path for the always-on recorder when using
+    MJPG at 640x400.
+    """
+
+    def __init__(self, device="/dev/video0", width=640, height=400, fps=120,
+                 logger=None):
+        self.device = device
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self.log = logger
+        self._dev = None
+        self._iter = None
+        try:
+            import v4l2py  # noqa
+            self._v4l2py = v4l2py
+            self.available = True
+        except Exception:
+            self._v4l2py = None
+            self.available = False
+            if logger:
+                logger.warning("v4l2py not installed -- raw MJPEG capture "
+                               "unavailable. `pip install v4l2py` to enable the "
+                               "fast path; falling back to CameraV4L2 otherwise.")
+
+    def open(self) -> bool:
+        if not self.available:
+            return False
+        from v4l2py.device import Device, BufferType, PixelFormat
+        self._dev = Device(self.device)
+        self._dev.open()
+        # Configure MJPEG at the requested geometry/rate.
+        self._dev.set_format(BufferType.VIDEO_CAPTURE, self.width, self.height,
+                             PixelFormat.MJPEG)
+        try:
+            self._dev.set_fps(BufferType.VIDEO_CAPTURE, self.fps)
+        except Exception:
+            pass
+        self._iter = iter(self._dev)
+        if self.log:
+            self.log.info("RawMJPEGCamera open: %dx%d MJPG @%d (raw, no decode).",
+                          self.width, self.height, self.fps)
+        return True
+
+    def read_raw(self):
+        """Return (ok, jpeg_bytes) for one frame, without decoding."""
+        if self._iter is None:
+            return False, None
+        try:
+            frame = next(self._iter)
+            return True, bytes(frame.data)
+        except StopIteration:
+            return False, None
+        except Exception as e:
+            if self.log:
+                self.log.debug("raw read error: %s", e)
+            return False, None
+
+    def measure_fps(self, seconds=3.0) -> dict:
+        if self._iter is None:
+            return {"ok": False, "reason": "camera not open"}
+        n, drops = 0, 0
+        t0 = time.time()
+        while time.time() - t0 < seconds:
+            ok, _ = self.read_raw()
+            if ok:
+                n += 1
+            else:
+                drops += 1
+        dt = time.time() - t0
+        return {"ok": True, "frames": n, "seconds": round(dt, 3),
+                "fps": round(n / dt, 2) if dt else 0, "read_failures": drops}
+
+    def close(self):
+        try:
+            if self._dev:
+                self._dev.close()
+        except Exception:
+            pass
+        self._dev = None
+        self._iter = None
 
 
 class RingBuffer:

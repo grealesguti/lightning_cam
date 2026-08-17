@@ -162,9 +162,28 @@ class AS3935Sensor:
         reg0 = self._read_reg(0x00) & 0xC1
         self._write_reg(0x00, reg0 | (afe << 1))
 
+        # Verify the chip actually answered: write a known AFE value and read
+        # it back. An all-zero or all-0xFF read means the bus isn't working
+        # (wrong CS, wrong SPI/I2C mode, or the board is strapped for the
+        # other protocol). We surface this loudly instead of pretending success.
+        readback = self._read_reg(0x00)
+        self._comm_ok = readback not in (0x00, 0xFF)
         if self.log:
-            self.log.info("AS3935 configured (%s preset).",
-                          "indoor" if self.indoor else "outdoor")
+            if self._comm_ok:
+                self.log.info("AS3935 configured (%s preset). reg0x00=0x%02X (OK).",
+                              "indoor" if self.indoor else "outdoor", readback)
+            else:
+                self.log.error(
+                    "AS3935 NOT RESPONDING -- reg0x00 read back 0x%02X. "
+                    "The bus is not communicating. Checklist: (1) is the "
+                    "board in I2C mode? try --bus i2c and run `i2cdetect -y 1`; "
+                    "(2) correct chip-select? try --spi-dev 1; (3) check "
+                    "VCC=3.3V, GND, and SI/CS pin straps on the breakout.",
+                    readback)
+
+    def comm_ok(self) -> bool:
+        """True only if configure() confirmed the chip answered on the bus."""
+        return getattr(self, "_comm_ok", False)
 
     def set_noise_floor(self, level: int):
         """0..7 -- higher rejects more noise but also weaker strikes."""

@@ -192,11 +192,32 @@ def print_table(rows, log):
              "better) | exp = exposure")
 
 
+def bench_raw(device, w, h, fps, seconds, log):
+    """Benchmark RAW MJPEG capture (no decode) via v4l2py, if available."""
+    from lc_camera import RawMJPEGCamera
+    cam = RawMJPEGCamera(device=device, width=w, height=h, fps=fps, logger=log)
+    if not cam.available:
+        log.warning("Raw path unavailable (install with: pip install v4l2py).")
+        return None
+    if not cam.open():
+        log.error("Raw camera open failed.")
+        return None
+    for _ in range(8):
+        cam.read_raw()
+    res = cam.measure_fps(seconds)
+    cam.close()
+    log.info("  RAW MJPEG: %.1f fps (no decode) at %dx%d", res["fps"], w, h)
+    return {"req": f"{w}x{h}", "mode": "RAW-MJPG", "delivered_fps": res["fps"],
+            "read_fails": res["read_failures"]}
+
+
 def main():
     ap = argparse.ArgumentParser(description="Camera speed + quality benchmark")
     ap.add_argument("--device", default="/dev/video0")
     ap.add_argument("--sweep", action="store_true",
                     help="run the built-in mode sweep")
+    ap.add_argument("--raw", action="store_true",
+                    help="also benchmark RAW MJPEG capture (no decode) via v4l2py")
     ap.add_argument("--width", type=int, default=640)
     ap.add_argument("--height", type=int, default=400)
     ap.add_argument("--fourcc", default="MJPG", choices=list(FOURCC))
@@ -231,6 +252,9 @@ def main():
                      r["delivered_fps"], r["grab_only_fps"],
                      r["decode_penalty_fps"], r["jitter_ms"],
                      r["sharpness"], r["exposure_flag"])
+        # optional raw comparison for MJPG modes
+        if args.raw and cc == "MJPG":
+            bench_raw(args.device, w, h, f, args.seconds, log)
         time.sleep(0.3)
 
     print_table(rows, log)
