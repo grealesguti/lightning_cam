@@ -66,6 +66,12 @@ class LightningRecorder:
         self.status_csv = StatusCsv(os.path.join(self.output_dir, "status_log.csv"))
         self.power = PowerMonitor(logger=log)
 
+        # optional periodic snapshots (heartbeat imagery on quiet nights)
+        self.snapshots_dir = os.path.join(self.output_dir, "snapshots")
+        if getattr(args, "snapshot_every", 0) and args.snapshot_every > 0:
+            os.makedirs(self.snapshots_dir, exist_ok=True)
+        self._last_snapshot = time.time()
+
         self.cam = CameraV4L2(device=args.device, width=args.width,
                               height=args.height, fps=args.fps,
                               fourcc=args.fourcc, mono=True, logger=log)
@@ -82,6 +88,8 @@ class LightningRecorder:
         self._events_total = 0
         self._last_status = time.time()
         self._fps_window_start = time.time()
+        self._last_recal = time.time()
+        self._cur_exposure = getattr(args, "exposure", None)
 
         # trigger coordination
         self._trigger_lock = threading.Lock()
@@ -199,6 +207,22 @@ class LightningRecorder:
                 if now - self._last_status >= self.args.status_every:
                     self._write_status(reason="heartbeat")
 
+                # periodic snapshot (still frame) if enabled
+                snap_every_s = getattr(self.args, "snapshot_every", 0) * 60.0
+                if snap_every_s > 0 and now - self._last_snapshot >= snap_every_s:
+                    self._last_snapshot = now
+                    if ok and frame is not None:
+                        self._save_snapshot(frame)
+
+                # periodic exposure recalibration during quiet periods only.
+                # (We're between events here -- _record_event blocks, so this
+                #  line never runs mid-capture; exposure stays fixed per event.)
+                recal_s = getattr(self.args, "recal_every", 0)
+                if recal_s > 0 and now - self._last_recal >= recal_s:
+                    self._last_recal = now
+                    if ok and frame is not None:
+                        self._recalibrate(frame)
+
                 # manual key trigger (optional, for bench testing without storms)
                 # handled via SIGUSR1 -> see signal handler
         except KeyboardInterrupt:
@@ -207,6 +231,77 @@ class LightningRecorder:
             self._shutdown()
 
     # ------------------------------------------------------------------ #
+    def _recalibrate(self, frame):
+        """
+        Nudge exposure toward the target sky brightness during quiet periods.
+        Damped (moves a fraction of the error) so it converges without
+        oscillating, and never runs during an event (see caller). Logs a line
+        the GUI parses to show 'last recalibrated' + refresh its preview.
+        """
+        import subprocess
+        try:
+            import cv2  # noqa
+        except Exception:
+            return
+        gray = frame if frame.ndim == 2 else frame[:, :, 0]
+        measured = float(gray.mean())
+        target = getattr(self.args, "target_brightness", 70)
+        if self._cur_exposure is None:
+            self._cur_exposure = 200
+        err = target - measured
+        if abs(err) <= 8:
+            self.log.info("recalibrate: sky=%.1f target=%d (within tolerance, "
+                          "exposure held at %d)", measured, target,
+                          self._cur_exposure)
+            return
+        factor = 2.0 if measured <= 1 else 1.0 + 0.4 * (err / max(measured, 1))
+        new_exp = int(max(1, min(2000, round(self._cur_exposure * factor))))
+        old = self._cur_exposure
+        self._cur_exposure = new_exp
+        for name in ("exposure_time_absolute", "exposure_absolute"):
+            try:
+                subprocess.run(["v4l2-ctl", "-d", self.args.device,
+                                "--set-ctrl", f"{name}={new_exp}"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               timeout=3)
+            except Exception:
+                pass
+        self.log.info("recalibrate: sky=%.1f target=%d -> exposure %d->%d",
+                      measured, target, old, new_exp)
+
+    def _save_snapshot(self, frame):
+        """Save a single current frame + a tiny sidecar (sensor/power now)."""
+        try:
+            import cv2
+        except Exception:
+            self.log.warning("Snapshot skipped: OpenCV unavailable.")
+            return
+        stamp = ts_compact()
+        img_path = os.path.join(self.snapshots_dir, f"snap_{stamp}.jpg")
+        try:
+            cv2.imwrite(img_path, frame)
+        except Exception as e:
+            self.log.warning("Snapshot save failed: %s", e)
+            return
+        # small sidecar so a snapshot also carries context
+        power_snap = self.power.snapshot()
+        last_sensor = self.sensor.last_registers if self.sensor else {}
+        side = {
+            "snapshot_id": stamp,
+            "time": now_iso(),
+            "camera": self.cam.describe(),
+            "power": power_snap,
+            "last_sensor_event": {
+                "kind": last_sensor.get("kind"),
+                "distance_km": last_sensor.get("distance_km"),
+                "energy": last_sensor.get("energy"),
+            } if last_sensor else None,
+            "saved_as": os.path.basename(img_path),
+        }
+        with open(os.path.join(self.snapshots_dir, f"snap_{stamp}.json"), "w") as f:
+            json.dump(side, f, indent=2)
+        self.log.info("Snapshot saved -> %s", img_path)
+
     def _record_event(self, trigger_ev):
         """Splice pre-roll from ring + capture POST seconds, then save."""
         t_trigger = time.time()
@@ -239,6 +334,8 @@ class LightningRecorder:
             self.log.error("Failed to save event: %s", e)
             return
 
+        total_secs = self.args.pre + self.args.post
+        measured_fps = round(len(frames) / total_secs, 1) if total_secs else 0
         sidecar = {
             "event_id": stamp,
             "trigger_time": now_iso(),
@@ -247,6 +344,7 @@ class LightningRecorder:
             "post_frames": len(post),
             "pre_seconds": self.args.pre,
             "post_seconds": self.args.post,
+            "measured_fps": measured_fps,
             "camera": self.cam.describe(),
             "sensor": {
                 "kind": trigger_ev["kind"],
@@ -397,6 +495,9 @@ def build_argparser():
                         "periods (0=off); never runs during an event")
     g.add_argument("--target-brightness", type=int, default=70,
                    help="sky-background brightness target for recalibration")
+    g.add_argument("--snapshot-every", type=float, default=0,
+                   help="save a single still frame every N minutes even if no "
+                        "event happens (0=off). Goes to <output>/snapshots/.")
 
     g = ap.add_argument_group("sensor")
     g.add_argument("--no-sensor", action="store_true",

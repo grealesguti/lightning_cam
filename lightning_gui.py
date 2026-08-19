@@ -76,6 +76,8 @@ class AppState:
             "outdoor": True,
             # recal
             "recal_every": 120, "target_brightness": 70,
+            # periodic snapshots (minutes; 0 = off)
+            "snapshot_every": 0,
         }
 
         # live camera preview
@@ -95,6 +97,10 @@ class AppState:
         self.event_active = False        # True while an event is being captured
         self.events_saved = 0
         self.last_status = {}
+        self.events_dir = None            # set once the recorder reports its output
+        self.last_recal = None            # {"time":..., "detail":...}
+        self.last_snapshot = None         # {"time":..., "file":...}
+        self._refresh_preview_flag = threading.Event()
 
     # ---- camera preview --------------------------------------------------
     def start_preview(self):
@@ -138,6 +144,29 @@ class AppState:
         if self.preview_thread:
             self.preview_thread.join(timeout=2)
 
+    def refresh_preview_soon(self):
+        """
+        Ask the preview to update. While recording, the GUI doesn't own the
+        camera (the recorder does), so the freshest image we can show is the
+        latest snapshot written to disk. This loads it as the preview image.
+        """
+        self._refresh_preview_flag.set()
+        # if recording, pull the newest snapshot jpg from disk into the preview
+        if self.recording and self.events_dir:
+            snap_dir = os.path.join(os.path.dirname(self.events_dir), "snapshots")
+            try:
+                if os.path.isdir(snap_dir):
+                    jpgs = [os.path.join(snap_dir, f) for f in os.listdir(snap_dir)
+                            if f.endswith(".jpg")]
+                    if jpgs:
+                        newest = max(jpgs, key=os.path.getmtime)
+                        with open(newest, "rb") as f:
+                            data = f.read()
+                        with self.preview_lock:
+                            self.preview_jpeg = data
+            except Exception:
+                pass
+
     def get_preview(self):
         with self.preview_lock:
             return self.preview_jpeg
@@ -178,6 +207,43 @@ class AppState:
             self.sensor = None
 
     # ---- status snapshot for the UI --------------------------------------
+    def last_event(self):
+        """
+        Return stats from the most recent event's JSON sidecar, or None.
+        Reads the newest event_*.json in the events dir the recorder reported.
+        """
+        ev_dir = self.events_dir
+        if not ev_dir or not os.path.isdir(ev_dir):
+            return None
+        try:
+            sidecars = [os.path.join(ev_dir, f) for f in os.listdir(ev_dir)
+                        if f.startswith("event_") and f.endswith(".json")]
+            if not sidecars:
+                return None
+            newest = max(sidecars, key=os.path.getmtime)
+            with open(newest) as f:
+                data = json.load(f)
+            sensor = data.get("sensor", {})
+            power = data.get("power", {})
+            return {
+                "event_id": data.get("event_id"),
+                "trigger_time": data.get("trigger_time"),
+                "measured_fps": data.get("measured_fps"),
+                "n_frames": data.get("n_frames"),
+                "pre_frames": data.get("pre_frames"),
+                "post_frames": data.get("post_frames"),
+                "camera": data.get("camera"),
+                "sensor_kind": sensor.get("kind"),
+                "distance_km": sensor.get("distance_km"),
+                "energy": sensor.get("energy"),
+                "power_throttled": power.get("throttled_hex"),
+                "power_volt": power.get("core_volt_v"),
+                "power_temp": power.get("soc_temp_c"),
+                "saved_as": data.get("saved_as"),
+            }
+        except Exception:
+            return None
+
     def diagnostics(self):
         """
         Check for common problems and return a list of warning dicts:
@@ -305,6 +371,9 @@ class AppState:
                      "device": u["device"]} for u in usb],
             "settings": dict(self.settings),
             "diagnostics": self.diagnostics(),
+            "last_event": self.last_event(),
+            "last_recal": self.last_recal,
+            "last_snapshot": self.last_snapshot,
         }
 
 
@@ -374,6 +443,22 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
    <div class="kv"><span>SoC temp</span><b id="p_temp">-</b></div>
    <div class="kv"><span>Warnings</span><b id="p_warn">-</b></div>
    <div class="kv"><span>Events saved</span><b id="p_events">0</b></div>
+   <div class="kv"><span>Last recalibrated</span><b id="p_recal">never</b></div>
+   <div class="kv"><span>Last snapshot</span><b id="p_snap">never</b></div>
+   <div id="lastevt" style="margin-top:10px;padding-top:8px;border-top:1px solid #262c38">
+     <div class="muted">Last event</div>
+     <div id="le_none" class="muted">No events captured yet.</div>
+     <div id="le_body" style="display:none">
+       <div class="kv"><span>When</span><b id="le_time">-</b></div>
+       <div class="kv"><span>Measured FPS</span><b id="le_fps">-</b></div>
+       <div class="kv"><span>Frames (pre+post)</span><b id="le_frames">-</b></div>
+       <div class="kv"><span>Camera</span><b id="le_cam">-</b></div>
+       <div class="kv"><span>Type / distance</span><b id="le_sensor">-</b></div>
+       <div class="kv"><span>Energy</span><b id="le_energy">-</b></div>
+       <div class="kv"><span>Power at event</span><b id="le_power">-</b></div>
+       <div class="kv"><span>Saved as</span><b id="le_file">-</b></div>
+     </div>
+   </div>
  </div>
 
  <div class="card">
@@ -390,6 +475,8 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
    <label>Recalibrate every N s (0=off) — never runs during an event</label>
    <div class="row"><div><input id="recal_every"></div>
      <div><label style="margin:0">Target bright</label><input id="target_brightness"></div></div>
+   <label>Snapshot every N minutes (0=off) — saves a still even with no event</label>
+   <input id="snapshot_every">
  </div>
 
  <div class="card">
@@ -427,7 +514,8 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <script>
 const $=id=>document.getElementById(id);
 const FIELDS=["width","height","fps","exposure","gain","pre","post","format",
-  "bus","irq_gpio","noise_floor","watchdog","spike","recal_every","target_brightness"];
+  "bus","irq_gpio","noise_floor","watchdog","spike","recal_every","target_brightness",
+  "snapshot_every"];
 const CHECKS=["mask_disturbers","outdoor"];
 
 function fillSettings(s){
@@ -515,6 +603,36 @@ async function poll(){
       `<span class="pill bad">${s.power.warnings.join(", ")}</span>`:
       `<span class="pill ok">clean</span>`;
     $("p_events").textContent=s.events_saved;
+    // last recalibration + last snapshot
+    const lr=s.last_recal, ls=s.last_snapshot;
+    $("p_recal").textContent=lr?
+      ((lr.time.split("T")[1]||lr.time)+" — "+lr.detail):"never";
+    $("p_snap").textContent=ls?
+      ((ls.time.split("T")[1]||ls.time)+" — "+(ls.file||"")):"never";
+    // if a recal or snapshot is newer than what we last saw, refresh preview now
+    const rkey=(lr?lr.time:"")+"|"+(ls?ls.time:"");
+    if(window._lastRefreshKey!==undefined && window._lastRefreshKey!==rkey){
+      $("preview").src="/preview.jpg?"+Date.now();
+    }
+    window._lastRefreshKey=rkey;
+    // last event stats
+    const le=s.last_event;
+    if(le){
+      $("le_none").style.display="none"; $("le_body").style.display="block";
+      $("le_time").textContent=(le.trigger_time||"").replace("T"," ");
+      $("le_fps").textContent=le.measured_fps!=null?le.measured_fps+" fps":"-";
+      $("le_frames").textContent=le.n_frames!=null?
+        `${le.n_frames} (${le.pre_frames}+${le.post_frames})`:"-";
+      $("le_cam").textContent=le.camera||"-";
+      $("le_sensor").textContent=`${le.sensor_kind||"-"} / `+
+        (le.distance_km!=null?le.distance_km+" km":"out-of-range");
+      $("le_energy").textContent=le.energy!=null?le.energy:"-";
+      $("le_power").textContent=`${le.power_throttled||"-"}, `+
+        `${le.power_volt??"-"}V, ${le.power_temp??"-"}°C`;
+      $("le_file").textContent=le.saved_as||"-";
+    } else {
+      $("le_none").style.display="block"; $("le_body").style.display="none";
+    }
     // diagnostics banner
     const db=$("diagbar");
     if(s.diagnostics && s.diagnostics.length){
@@ -608,7 +726,7 @@ class Handler(BaseHTTPRequestHandler):
         s = self.state.settings
         ints = ["width", "height", "fps", "exposure", "gain", "irq_gpio",
                 "noise_floor", "watchdog", "spike", "target_brightness"]
-        floats = ["pre", "post", "recal_every"]
+        floats = ["pre", "post", "recal_every", "snapshot_every"]
         for k, v in data.items():
             if k in ints:
                 s[k] = int(float(v))
@@ -665,6 +783,9 @@ class BackgroundRecorder:
         if float(s.get("recal_every", 0) or 0) > 0:
             cmd += ["--recal-every", str(s["recal_every"]),
                     "--target-brightness", str(s["target_brightness"])]
+        # periodic snapshots
+        if float(s.get("snapshot_every", 0) or 0) > 0:
+            cmd += ["--snapshot-every", str(s["snapshot_every"])]
         # sensor tuning
         if s.get("noise_floor") not in (None, ""):
             cmd += ["--noise-floor", str(s["noise_floor"])]
@@ -724,6 +845,18 @@ class BackgroundRecorder:
             self.log.info("[recorder] %s", line)
             if "Output dir:" in line:
                 self.output_dir = line.split("Output dir:", 1)[1].strip()
+                self.state.events_dir = os.path.join(self.output_dir, "events")
+            # recalibration happened -> record time + detail, refresh preview
+            if "recalibrate:" in line:
+                detail = line.split("recalibrate:", 1)[1].strip()
+                self.state.last_recal = {"time": now_iso(), "detail": detail}
+                self.state.refresh_preview_soon()
+            # a snapshot was taken -> record it + refresh preview
+            if "Snapshot saved" in line:
+                fname = line.split("->", 1)[1].strip() if "->" in line else ""
+                self.state.last_snapshot = {"time": now_iso(),
+                                            "file": os.path.basename(fname)}
+                self.state.refresh_preview_soon()
             # update the saved-events counter from disk
             if self.output_dir:
                 self._update_count()
