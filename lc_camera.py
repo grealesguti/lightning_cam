@@ -199,38 +199,124 @@ class RawMJPEGCamera:
             return int(d.replace("/dev/video", ""))
         return int(d)
 
+    def _set_ctrl(self, name, val):
+        """Set a single v4l2 control by name. Best-effort, never raises."""
+        import subprocess
+        dev = self.device if isinstance(self.device, str) else f"/dev/video{self.device}"
+        try:
+            subprocess.run(["v4l2-ctl", "-d", dev, "--set-ctrl", f"{name}={val}"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=3)
+        except Exception:
+            pass
+
     def _apply_controls(self):
         """
         Set manual exposure/gain via v4l2 controls. Uses v4l2-ctl as the
         portable path (control names vary by driver). Best-effort: logs what it
         set and never raises.
         """
-        import subprocess
-        cmds = []
         # Turn OFF auto-exposure first (value 1 = manual mode in V4L2's
         # exposure_auto menu; drivers differ, so we try both common names).
         if not self.auto_exposure:
-            cmds.append(("exposure_auto", 1))
-            cmds.append(("auto_exposure", 1))
+            self._set_ctrl("exposure_auto", 1)
+            self._set_ctrl("auto_exposure", 1)
         if self.exposure is not None:
-            cmds.append(("exposure_time_absolute", self.exposure))
-            cmds.append(("exposure_absolute", self.exposure))
+            self._set_ctrl("exposure_time_absolute", self.exposure)
+            self._set_ctrl("exposure_absolute", self.exposure)
         if self.gain is not None:
-            cmds.append(("gain", self.gain))
-        for name, val in cmds:
-            try:
-                subprocess.run(
-                    ["v4l2-ctl", "-d", self.device if isinstance(self.device, str)
-                     else f"/dev/video{self.device}",
-                     "--set-ctrl", f"{name}={val}"],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    timeout=3)
-            except Exception:
-                pass
+            self._set_ctrl("gain", self.gain)
         if self.log and (self.exposure is not None or self.gain is not None):
             self.log.info("Applied manual controls: exposure=%s gain=%s "
                           "auto_exposure=%s", self.exposure, self.gain,
                           self.auto_exposure)
+
+    def set_exposure(self, value):
+        """Update manual exposure live (device units)."""
+        self.exposure = int(value)
+        self._set_ctrl("exposure_time_absolute", self.exposure)
+        self._set_ctrl("exposure_absolute", self.exposure)
+
+    def set_gain(self, value):
+        """Update manual gain live."""
+        self.gain = int(value)
+        self._set_ctrl("gain", self.gain)
+
+    def recalibrate(self, target_brightness=70, tolerance=8,
+                    exp_min=1, exp_max=2000, step_frac=0.4,
+                    event_active=None):
+        """
+        Adjust exposure so the CURRENT scene's mean brightness approaches
+        `target_brightness` (0-255). Meant to be called PERIODICALLY DURING
+        QUIET PERIODS ONLY -- never mid-event -- so the exposure stays fixed
+        while a strike is being captured (a changing exposure would corrupt the
+        motion/brightness analysis).
+
+        Event safety: pass `event_active` as either a bool or a zero-arg
+        callable returning bool. If it is (or returns) True, recalibration is
+        SKIPPED and returns {"ok": False, "reason": "event active"}. This is a
+        hard guard so a mistimed periodic call can never change exposure while
+        an event is being recorded.
+
+        This keeps manual exposure (no auto-exposure pumping): it measures one
+        decoded frame, computes how far off target the sky background is, and
+        nudges the exposure by a fraction of the error. Over a few calls it
+        converges, then holds steady.
+
+        Returns a dict describing what it did. Requires OpenCV to decode the
+        sample frame; if unavailable it no-ops.
+        """
+        # hard event guard -- never adjust exposure during a capture
+        active = event_active() if callable(event_active) else event_active
+        if active:
+            return {"ok": False, "reason": "event active", "changed": False}
+
+        try:
+            import cv2
+        except Exception:
+            return {"ok": False, "reason": "opencv unavailable"}
+
+        if self.exposure is None:
+            # nothing to anchor to; seed a mid value
+            self.exposure = 200
+
+        # grab a fresh frame and measure background brightness (use the median
+        # so an in-frame bright object doesn't skew the reading)
+        ok, jpg = self.read_raw()
+        if not ok or not jpg:
+            return {"ok": False, "reason": "no frame"}
+        img = CameraV4L2.decode_jpeg(jpg, mono=True)
+        if img is None:
+            return {"ok": False, "reason": "decode failed"}
+        measured = float(np.median(img))
+
+        err = target_brightness - measured
+        result = {"ok": True, "measured": round(measured, 1),
+                  "target": target_brightness, "old_exposure": self.exposure,
+                  "changed": False}
+
+        if abs(err) <= tolerance:
+            result["reason"] = "within tolerance"
+            result["new_exposure"] = self.exposure
+            return result
+
+        # exposure ~ linear-ish with brightness for small steps; move a
+        # fraction of the proportional correction to avoid oscillation.
+        if measured <= 1:
+            factor = 2.0                      # very dark -> open up hard
+        else:
+            factor = 1.0 + step_frac * (err / max(measured, 1))
+        new_exp = int(max(exp_min, min(exp_max, round(self.exposure * factor))))
+
+        if new_exp != self.exposure:
+            self.set_exposure(new_exp)
+            result["changed"] = True
+        result["new_exposure"] = new_exp
+        if self.log:
+            self.log.info("recalibrate: sky median=%.1f target=%d -> exposure "
+                          "%d->%d", measured, target_brightness,
+                          result["old_exposure"], new_exp)
+        return result
 
     def open(self) -> bool:
         if not self.available:
