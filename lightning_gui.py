@@ -305,9 +305,9 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
 
  <div class="card">
    <h2>Control</h2>
-   <button onclick="save()">Apply settings</button>
-   <button id="startbtn" onclick="startRec()">Start recording</button>
-   <button class="stop" onclick="stopRec()">Stop recording</button>
+   <button onclick="save(event)">Apply settings</button>
+   <button id="startbtn" onclick="startRec(event)">Start recording</button>
+   <button class="stop" onclick="stopRec(event)">Stop recording</button>
    <hr style="border-color:#262c38;margin:14px 0">
    <button class="ghost" onclick="detach()">Detach GUI (keep recording)</button>
    <div class="muted">Detach stops this web server but leaves the recorder
@@ -334,18 +334,52 @@ function collect(){
   o.output=$("output").value;
   return o;
 }
-async function save(){
-  await fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify(collect())});
+async function save(ev){
+  const btn=ev&&ev.target;
+  try{
+    const r=await fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify(collect())});
+    const j=await r.json();
+    flash(btn, j.ok?"Applied ✓":"Failed ✗", j.ok);
+    return j.ok;
+  }catch(e){ flash(btn,"Error ✗",false); return false; }
 }
-async function startRec(){ await save(); await fetch("/api/start",{method:"POST"}); }
-async function stopRec(){ await fetch("/api/stop",{method:"POST"}); }
+async function startRec(){
+  const btn=$("startbtn");
+  const okSave=await saveQuiet();
+  if(!okSave){ flash(btn,"Apply failed ✗",false); return; }
+  try{
+    const r=await fetch("/api/start",{method:"POST"}); const j=await r.json();
+    if(j.ok){ flash(btn,"Started ✓",true); }
+    else{ flash(btn,(j.reason||"failed")+" ✗",false);
+      alert("Could not start recording: "+(j.reason||"unknown")); }
+  }catch(e){ flash(btn,"Error ✗",false); alert("Start error: "+e); }
+}
+async function stopRec(ev){
+  const btn=ev&&ev.target;
+  try{
+    const r=await fetch("/api/stop",{method:"POST"}); const j=await r.json();
+    flash(btn,"Stopped ✓",true);
+  }catch(e){ flash(btn,"Error ✗",false); }
+}
+async function saveQuiet(){
+  try{
+    const r=await fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify(collect())});
+    return (await r.json()).ok;
+  }catch(e){ return false; }
+}
+function flash(btn,msg,ok){
+  if(!btn)return; const orig=btn.textContent;
+  btn.textContent=msg; btn.style.background=ok?"#1f8a4c":"#c0392b";
+  setTimeout(()=>{ btn.textContent=orig; btn.style.background=""; }, 1600);
+}
 async function detach(){
   if(!confirm("Stop the GUI but keep recording in the background?"))return;
-  await save();
+  await saveQuiet();
   await fetch("/api/detach",{method:"POST"});
-  document.body.innerHTML="<header>Detached. Recorder still running. "+
-    "Re-launch lightning_gui.py to reattach.</header>";
+  document.body.innerHTML="<header>Detached. Recorder still running in the "+
+    "background. Re-launch lightning_gui.py to reattach.</header>";
 }
 async function refreshUsb(){
   const r=await fetch("/api/usb"); const j=await r.json();
@@ -374,8 +408,10 @@ async function poll(){
     $("p_events").textContent=s.events_saved;
     const rs=$("recstate");
     if(s.recording){ rs.textContent=s.event_active?"CAPTURING EVENT":"recording";
-      rs.className="pill "+(s.event_active?"warn":"ok"); }
-    else { rs.textContent="idle"; rs.className="pill"; }
+      rs.className="pill "+(s.event_active?"warn":"ok");
+      $("startbtn").disabled=true; $("startbtn").style.opacity=.5; }
+    else { rs.textContent="idle"; rs.className="pill";
+      $("startbtn").disabled=false; $("startbtn").style.opacity=1; }
     if($("width").dataset.init!=="1"){ fillSettings(s.settings);
       $("width").dataset.init="1"; refreshUsb(); }
   }catch(e){}
@@ -391,9 +427,8 @@ poll();
 # HTTP handler
 # --------------------------------------------------------------------------- #
 class Handler(BaseHTTPRequestHandler):
-    state: AppState = None          # set on the server instance
-    recorder_launcher = None        # callable(settings) -> starts recorder
-    recorder_stopper = None
+    state: AppState = None          # set on the class before serving
+    recorder = None                 # BackgroundRecorder instance
     detach_flag = None
 
     def log_message(self, *a):      # silence default noisy logging
@@ -440,11 +475,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(400, json.dumps({"ok": False, "err": str(e)}),
                            "application/json")
         elif p == "/api/start":
-            self.recorder_launcher(self.state.settings)
-            self._send(200, json.dumps({"ok": True}), "application/json")
+            res = self.recorder.start(self.state.settings)
+            self._send(200, json.dumps(res), "application/json")
         elif p == "/api/stop":
-            self.recorder_stopper()
-            self._send(200, json.dumps({"ok": True}), "application/json")
+            res = self.recorder.stop()
+            self._send(200, json.dumps(res), "application/json")
         elif p == "/api/detach":
             # signal the main loop to shut down the web server but leave the
             # recorder thread running.
@@ -475,66 +510,137 @@ class Handler(BaseHTTPRequestHandler):
 # --------------------------------------------------------------------------- #
 class BackgroundRecorder:
     """
-    Minimal in-process recorder used by the GUI. It reuses the raw camera + ring
-    concept, sets event_active around each capture so recalibration is blocked,
-    and periodically recalibrates ONLY when no event is active.
+    Launches the REAL recorder (lightning_run.py) as a subprocess so clicking
+    Start actually captures and SAVES events.
 
-    For the full-featured recorder use lightning_run.py; this keeps the GUI
-    self-contained and demonstrates the event-safe recal guard.
+    Resource handoff: the GUI holds the camera (preview) and the sensor (data
+    panel) open. The recorder subprocess needs those same devices, so on Start
+    we RELEASE the GUI's preview + sensor, launch lightning_run.py, and stream
+    its log. On Stop we terminate the subprocess and RE-CLAIM preview + sensor
+    so the panels come back live.
+
+    State is truthful: `state.recording` reflects whether the subprocess is
+    alive, and `state.events_saved` is derived from the actual event files on
+    disk (so the counter matches reality, not a guess).
     """
-    def __init__(self, state: AppState, log):
+    def __init__(self, state: AppState, log, project_dir, python_exe):
         self.state = state
         self.log = log
-        self.thread = None
-        self.stop_flag = threading.Event()
+        self.project_dir = project_dir
+        self.python_exe = python_exe
+        self.proc = None
+        self.watch_thread = None
+        self.output_dir = None
+
+    def _build_cmd(self, s):
+        cmd = [self.python_exe, os.path.join(self.project_dir, "lightning_run.py"),
+               "--width", str(s["width"]), "--height", str(s["height"]),
+               "--fps", str(s["fps"]),
+               "--pre", str(s["pre"]), "--post", str(s["post"]),
+               "--format", s["format"],
+               "--bus", s["bus"], "--irq-gpio", str(s["irq_gpio"]),
+               "--status-every", "30"]
+        if s.get("output"):
+            cmd += ["--output", s["output"]]
+        if s.get("outdoor"):
+            cmd += ["--outdoor"]
+        # resolve where events will land, for the counter
+        return cmd
 
     def start(self, settings):
-        if self.thread and self.thread.is_alive():
-            self.log.info("Recorder already running.")
-            return
-        self.stop_flag.clear()
-        self.thread = threading.Thread(target=self._run, args=(dict(settings),),
-                                       daemon=True)
-        self.thread.start()
+        if self.proc and self.proc.poll() is None:
+            self.log.info("Recorder already running (pid %s).", self.proc.pid)
+            return {"ok": False, "reason": "already running"}
+
+        s = dict(settings)
+
+        # 1) release the GUI's hold on camera + sensor so the child can open them
+        self.log.info("Handing devices to recorder: releasing preview + sensor.")
+        self.state.stop_preview()
+        self.state.stop_sensor()
+        time.sleep(0.4)     # let the devices settle
+
+        # 2) launch the real recorder
+        import subprocess
+        cmd = self._build_cmd(s)
+        self.log.info("Starting recorder: %s", " ".join(cmd))
+        try:
+            self.proc = subprocess.Popen(
+                cmd, cwd=self.project_dir,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1)
+        except Exception as e:
+            self.log.error("Failed to launch recorder: %s", e)
+            # reclaim devices since we didn't hand them off
+            self.state.start_sensor()
+            self.state.start_preview()
+            return {"ok": False, "reason": str(e)}
+
+        self.state.recording = True
+        # 3) stream the child's log and watch the events dir for the counter
+        self.watch_thread = threading.Thread(target=self._watch, daemon=True)
+        self.watch_thread.start()
+        return {"ok": True, "pid": self.proc.pid}
+
+    def _watch(self):
+        # capture the output dir from the child's log line "Output dir: ..."
+        for line in iter(self.proc.stdout.readline, ""):
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            self.log.info("[recorder] %s", line)
+            if "Output dir:" in line:
+                self.output_dir = line.split("Output dir:", 1)[1].strip()
+            # update the saved-events counter from disk
+            if self.output_dir:
+                self._update_count()
+        # subprocess ended
+        rc = self.proc.poll()
+        self.log.info("Recorder subprocess exited (code %s).", rc)
+        self.state.recording = False
+        # reclaim devices for the GUI panels
+        self.state.start_sensor()
+        self.state.start_preview()
+
+    def _update_count(self):
+        try:
+            ev_dir = os.path.join(self.output_dir, "events")
+            if os.path.isdir(ev_dir):
+                n = len([f for f in os.listdir(ev_dir)
+                         if f.startswith("event_") and
+                         (f.endswith(".npy") or f.endswith(".mp4") or
+                          f.endswith("_frames") or f.endswith(".json") is False)])
+                # count unique event ids by json sidecars (most reliable)
+                n = len([f for f in os.listdir(ev_dir) if f.endswith(".json")])
+                self.state.events_saved = n
+        except Exception:
+            pass
 
     def stop(self):
-        self.stop_flag.set()
-        self.state.recording = False
-
-    def _run(self, s):
-        # start sensor if not already
-        if self.state.sensor is None:
-            self.state.start_sensor()
-
-        cam = RawMJPEGCamera(device=s["device"], width=s["width"],
-                             height=s["height"], fps=s["fps"],
-                             exposure=s["exposure"], gain=s["gain"],
-                             auto_exposure=False, logger=self.log)
-        if not cam.open():
-            self.log.error("Recorder camera open failed (need linuxpy). "
-                           "Recording aborted.")
-            return
-        self.state.recording = True
-        last_recal = time.time()
-        self.log.info("Background recorder running.")
-        try:
-            while not self.stop_flag.is_set():
-                ok, _jpg = cam.read_raw()
-                now = time.time()
-                # periodic recalibration -- BLOCKED while an event is active
-                if (s["recal_every"] > 0 and
-                        now - last_recal >= s["recal_every"]):
-                    last_recal = now
-                    cam.recalibrate(target_brightness=s["target_brightness"],
-                                    event_active=lambda: self.state.event_active)
-                # (event capture logic would set self.state.event_active=True
-                #  around a real trigger; see lightning_run.py for the full
-                #  ring-buffer + save implementation.)
-                time.sleep(0)   # yield
-        finally:
-            cam.close()
+        if not self.proc or self.proc.poll() is not None:
             self.state.recording = False
-            self.log.info("Background recorder stopped.")
+            return {"ok": True, "reason": "not running"}
+        self.log.info("Stopping recorder (pid %s).", self.proc.pid)
+        import signal as _sig
+        try:
+            self.proc.send_signal(_sig.SIGINT)   # clean shutdown (flushes)
+            try:
+                self.proc.wait(timeout=8)
+            except Exception:
+                self.proc.terminate()
+                self.proc.wait(timeout=5)
+        except Exception as e:
+            self.log.error("Error stopping recorder: %s", e)
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
+        self.state.recording = False
+        # devices are reclaimed by _watch when the process ends
+        return {"ok": True}
+
+    def is_running(self):
+        return self.proc is not None and self.proc.poll() is None
 
 
 # --------------------------------------------------------------------------- #
@@ -552,7 +658,8 @@ def main():
 
     log = setup_logger("lightning_gui", args.log)
     state = AppState(log)
-    recorder = BackgroundRecorder(state, log)
+    project_dir = os.path.dirname(os.path.abspath(__file__))
+    recorder = BackgroundRecorder(state, log, project_dir, sys.executable)
     detach_flag = threading.Event()
 
     if not args.no_preview:
@@ -562,8 +669,7 @@ def main():
 
     # wire the handler class attributes
     Handler.state = state
-    Handler.recorder_launcher = staticmethod(lambda s: recorder.start(s))
-    Handler.recorder_stopper = staticmethod(lambda: recorder.stop())
+    Handler.recorder = recorder
     Handler.detach_flag = detach_flag
 
     server = ThreadingHTTPServer((args.host, args.port), Handler)
@@ -586,17 +692,17 @@ def main():
         server.shutdown()
         return 0
 
-    # detach path: stop the web server + preview, LEAVE recorder + sensor up
-    log.info("Detaching: stopping web server + preview; recorder keeps running.")
+    # detach path: stop the web server + preview, LEAVE the recorder subprocess
+    # running (it's an independent process, so it survives the GUI exiting).
+    log.info("Detaching: stopping web server + preview; recorder subprocess "
+             "keeps running (pid %s).",
+             recorder.proc.pid if recorder.is_running() else "none")
     state.stop_preview()
+    state.stop_sensor()
     server.shutdown()
-    # keep process alive so the daemon recorder thread survives
-    try:
-        while recorder.thread and recorder.thread.is_alive():
-            time.sleep(1)
-    except KeyboardInterrupt:
-        recorder.stop()
-        state.stop_sensor()
+    if recorder.is_running():
+        log.info("Recorder still running in background. Re-launch the GUI to "
+                 "reattach, or `kill %s` to stop it.", recorder.proc.pid)
     return 0
 
 
