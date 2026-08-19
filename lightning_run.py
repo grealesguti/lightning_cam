@@ -91,6 +91,8 @@ class LightningRecorder:
     def start(self):
         if not self.cam.open():
             raise RuntimeError("Camera failed to open.")
+        # apply manual exposure/gain if requested (stable brightness for motion)
+        self._apply_camera_controls()
         # prime the pipeline
         for _ in range(5):
             self.cam.read()
@@ -98,13 +100,53 @@ class LightningRecorder:
 
         if self.sensor and self.sensor.available:
             self.sensor.start(self._on_sensor_event)
+            if not self.sensor.comm_ok():
+                self.log.warning("AS3935 not responding on the bus -- check "
+                                 "wiring/SI strap/power. Triggers will not work.")
+            # apply tuning from CLI args (each only if provided)
+            a = self.args
+            if getattr(a, "noise_floor", None) is not None:
+                self.sensor.set_noise_floor(a.noise_floor)
+                self.log.info("Sensor noise floor set to %d", a.noise_floor)
+            if getattr(a, "watchdog", None) is not None:
+                self.sensor.set_watchdog_threshold(a.watchdog)
+                self.log.info("Sensor watchdog set to %d", a.watchdog)
+            if getattr(a, "spike", None) is not None:
+                self.sensor.set_spike_rejection(a.spike)
+                self.log.info("Sensor spike rejection set to %d", a.spike)
+            if getattr(a, "mask_disturbers", False):
+                self.sensor.mask_disturbers(True)
+                self.log.info("Sensor disturber masking ON (only lightning triggers).")
         elif self.sensor:
-            self.log.warning("Sensor unavailable -- running in --key-trigger mode "
-                             "only (or camera-only).")
+            self.log.warning("Sensor unavailable -- running camera-only "
+                             "(manual SIGUSR1 trigger still works).")
             self.sensor = None
 
         self.log.info("Output dir: %s", self.output_dir)
         self._log_usb_state()
+
+    def _apply_camera_controls(self):
+        """Set manual exposure/gain via v4l2-ctl (stable brightness for motion)."""
+        import subprocess
+        a = self.args
+        dev = a.device
+        def setctrl(name, val):
+            try:
+                subprocess.run(["v4l2-ctl", "-d", dev, "--set-ctrl", f"{name}={val}"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               timeout=3)
+            except Exception as e:
+                self.log.warning("Could not set %s=%s: %s", name, val, e)
+        if not getattr(a, "auto_exposure", False):
+            setctrl("exposure_auto", 1)
+            setctrl("auto_exposure", 1)
+        if getattr(a, "exposure", None) is not None:
+            setctrl("exposure_time_absolute", a.exposure)
+            setctrl("exposure_absolute", a.exposure)
+            self.log.info("Camera exposure set to %d (manual).", a.exposure)
+        if getattr(a, "gain", None) is not None:
+            setctrl("gain", a.gain)
+            self.log.info("Camera gain set to %d.", a.gain)
 
     def _log_usb_state(self):
         usb = find_usb_mounts()
@@ -337,6 +379,11 @@ def build_argparser():
     g.add_argument("--fps", type=int, default=120)
     g.add_argument("--fourcc", default="MJPG",
                    choices=["MJPG", "YUYV", "GREY", "Y8"])
+    g.add_argument("--exposure", type=int, default=None,
+                   help="manual exposure (v4l2 units); omit to leave as-is")
+    g.add_argument("--gain", type=int, default=None, help="manual gain")
+    g.add_argument("--auto-exposure", action="store_true",
+                   help="allow auto-exposure (NOT recommended for motion capture)")
 
     g = ap.add_argument_group("event timing")
     g.add_argument("--pre", type=float, default=1.5,
@@ -345,6 +392,11 @@ def build_argparser():
                    help="seconds captured AFTER the trigger")
     g.add_argument("--format", default="mp4", choices=["mp4", "npy", "png"],
                    help="how to store each event")
+    g.add_argument("--recal-every", type=float, default=0,
+                   help="auto-recalibrate exposure every N s during quiet "
+                        "periods (0=off); never runs during an event")
+    g.add_argument("--target-brightness", type=int, default=70,
+                   help="sky-background brightness target for recalibration")
 
     g = ap.add_argument_group("sensor")
     g.add_argument("--no-sensor", action="store_true",
@@ -355,6 +407,14 @@ def build_argparser():
     g.add_argument("--irq-gpio", type=int, default=17)
     g.add_argument("--outdoor", action="store_true",
                    help="outdoor AFE preset (recommended for rooftop/field)")
+    g.add_argument("--noise-floor", type=int, default=None,
+                   help="AS3935 noise floor 0..7 (higher rejects more noise)")
+    g.add_argument("--watchdog", type=int, default=None,
+                   help="AS3935 watchdog threshold 0..15")
+    g.add_argument("--spike", type=int, default=None,
+                   help="AS3935 spike rejection 0..15")
+    g.add_argument("--mask-disturbers", action="store_true",
+                   help="suppress disturber IRQs (only real lightning triggers)")
     g.add_argument("--trigger-on-disturber", action="store_true",
                    help="also save events on 'disturber' interrupts (debug)")
 

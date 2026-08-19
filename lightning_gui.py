@@ -178,6 +178,108 @@ class AppState:
             self.sensor = None
 
     # ---- status snapshot for the UI --------------------------------------
+    def diagnostics(self):
+        """
+        Check for common problems and return a list of warning dicts:
+        {"level": "warn"|"error", "msg": "..."}. Surfaced in the GUI so issues
+        are visible instead of silent.
+        """
+        warns = []
+
+        # --- power / throttle ---
+        p = self.power.snapshot()
+        mask = self.power.get_throttled_raw()
+        if mask:
+            active = self.power.active_warnings(mask)
+            # current undervoltage/throttle is an ERROR (affects capture now)
+            now_bad = [w for w in active if "now" in w.lower() or
+                       "detected" in w.lower() or "Currently" in w]
+            if any(("Under-voltage detected" == w or "Currently throttled" == w)
+                   for w in active):
+                warns.append({"level": "error",
+                              "msg": "Power: undervoltage / throttling NOW ("
+                                     + p.get("throttled_hex", "?") +
+                                     "). Frame rate will suffer and frames may "
+                                     "corrupt. Use a stronger 5V/3A supply and a "
+                                     "thick short cable."})
+            elif active:
+                warns.append({"level": "warn",
+                              "msg": "Power: throttling occurred earlier ("
+                                     + p.get("throttled_hex", "?") +
+                                     "). Watch the supply/battery."})
+
+        # --- temperature ---
+        t = p.get("soc_temp_c")
+        if t is not None and t >= 80:
+            warns.append({"level": "error",
+                          "msg": f"SoC temperature high ({t}°C) -- add cooling."})
+        elif t is not None and t >= 70:
+            warns.append({"level": "warn",
+                          "msg": f"SoC temperature warm ({t}°C)."})
+
+        # --- camera / preview ---
+        if not _HAVE_CV2:
+            warns.append({"level": "error",
+                          "msg": "OpenCV not available -- preview and decode "
+                                 "won't work. Activate the venv or install cv2."})
+        elif self.cam is None and not self.recording:
+            warns.append({"level": "warn",
+                          "msg": "Camera preview not running -- check the device "
+                                 "or that another process (recorder) holds it."})
+
+        # --- sensor ---
+        if self.sensor is None and not self.recording:
+            warns.append({"level": "warn",
+                          "msg": "Sensor not started -- no triggers. Check bus/"
+                                 "wiring, or it's handed to the recorder."})
+        elif self.sensor is not None and not self.sensor.comm_ok():
+            warns.append({"level": "error",
+                          "msg": "AS3935 not responding on the bus -- check SI "
+                                 "strap, CS pin, 3.3V power, solder joints."})
+
+        # --- suspiciously high 'lightning' rate = interference ---
+        with self.lock:
+            evs = list(self.sensor_events)
+        if len(evs) >= 10:
+            recent = evs[-20:]
+            lightning = [e for e in recent if e["kind"] == "lightning"]
+            if len(lightning) >= 15:
+                dists = {e["distance_km"] for e in lightning}
+                if len(dists) <= 1:
+                    warns.append({"level": "warn",
+                                  "msg": "Many 'lightning' events all at the same "
+                                         "distance -- likely RF interference from "
+                                         "the Pi/USB, not real strikes. Move the "
+                                         "sensor away from the Pi and cables."})
+
+        # --- USB / output ---
+        usb = find_usb_mounts()
+        out = self.settings.get("output", "")
+        if not usb and not out:
+            warns.append({"level": "warn",
+                          "msg": "No USB detected and no output set -- events "
+                                 "will fall back to the local disk (or fail). "
+                                 "Plug in a drive and Rescan, or set an output "
+                                 "path."})
+        else:
+            # low space check on the chosen/auto target
+            target = usb[0] if usb else None
+            if target and target["free"] is not None and target["free"] < 500_000_000:
+                warns.append({"level": "warn",
+                              "msg": f"USB nearly full ({human_bytes(target['free'])} "
+                                     "free)."})
+
+        # --- linuxpy (raw path) ---
+        try:
+            import linuxpy  # noqa
+        except Exception:
+            warns.append({"level": "warn",
+                          "msg": "linuxpy not installed -- raw high-fps capture "
+                                 "unavailable; recorder falls back to slower "
+                                 "decoded path. `pip install linuxpy`."})
+
+        return warns
+
     def snapshot(self):
         with self.lock:
             events = list(self.sensor_events)
@@ -202,6 +304,7 @@ class AppState:
             "usb": [{"mount": u["mount"], "free": human_bytes(u["free"]),
                      "device": u["device"]} for u in usb],
             "settings": dict(self.settings),
+            "diagnostics": self.diagnostics(),
         }
 
 
@@ -235,8 +338,14 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
  table{width:100%;border-collapse:collapse;font-size:12px}
  td,th{text-align:left;padding:3px 4px;border-bottom:1px solid #232a36}
  .muted{color:#7c8aa0;font-size:12px}
+ #diagbar{padding:0 16px}
+ .diag{margin:8px 0;padding:9px 12px;border-radius:8px;font-size:13px;font-weight:500}
+ .diag.error{background:#3a1414;border:1px solid #c0392b;color:#ffb4a8}
+ .diag.warn{background:#3a3014;border:1px solid #c98a1a;color:#ffe0a0}
+ #diagbar:empty{padding:0}
 </style></head><body>
 <header>⚡ Lightning Camera Control <span id="recstate" class="pill"></span></header>
+<div id="diagbar"></div>
 <div class="wrap">
 
  <div class="card" style="flex:2 1 480px">
@@ -406,6 +515,13 @@ async function poll(){
       `<span class="pill bad">${s.power.warnings.join(", ")}</span>`:
       `<span class="pill ok">clean</span>`;
     $("p_events").textContent=s.events_saved;
+    // diagnostics banner
+    const db=$("diagbar");
+    if(s.diagnostics && s.diagnostics.length){
+      db.innerHTML=s.diagnostics.map(d=>
+        `<div class="diag ${d.level}">${d.level==="error"?"⛔":"⚠️"} ${d.msg}</div>`
+      ).join("");
+    } else { db.innerHTML=""; }
     const rs=$("recstate");
     if(s.recording){ rs.textContent=s.event_active?"CAPTURING EVENT":"recording";
       rs.className="pill "+(s.event_active?"warn":"ok");
@@ -540,11 +656,28 @@ class BackgroundRecorder:
                "--format", s["format"],
                "--bus", s["bus"], "--irq-gpio", str(s["irq_gpio"]),
                "--status-every", "30"]
-        if s.get("output"):
-            cmd += ["--output", s["output"]]
+        # camera exposure/gain
+        if s.get("exposure") not in (None, ""):
+            cmd += ["--exposure", str(s["exposure"])]
+        if s.get("gain") not in (None, ""):
+            cmd += ["--gain", str(s["gain"])]
+        # recalibration
+        if float(s.get("recal_every", 0) or 0) > 0:
+            cmd += ["--recal-every", str(s["recal_every"]),
+                    "--target-brightness", str(s["target_brightness"])]
+        # sensor tuning
+        if s.get("noise_floor") not in (None, ""):
+            cmd += ["--noise-floor", str(s["noise_floor"])]
+        if s.get("watchdog") not in (None, ""):
+            cmd += ["--watchdog", str(s["watchdog"])]
+        if s.get("spike") not in (None, ""):
+            cmd += ["--spike", str(s["spike"])]
+        if s.get("mask_disturbers"):
+            cmd += ["--mask-disturbers"]
         if s.get("outdoor"):
             cmd += ["--outdoor"]
-        # resolve where events will land, for the counter
+        if s.get("output"):
+            cmd += ["--output", s["output"]]
         return cmd
 
     def start(self, settings):
