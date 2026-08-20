@@ -91,6 +91,45 @@ class CameraV4L2:
                           self.describe())
         return True
 
+    def set_exposure(self, value):
+        """
+        Set manual exposure LIVE via OpenCV props (reliable while streaming,
+        unlike an external v4l2-ctl call which the driver may ignore once
+        OpenCV owns the device). Disables auto-exposure first.
+        Returns True if the property write was accepted.
+        """
+        if not self.cap:
+            return False
+        # 0.25 = manual mode in OpenCV's V4L2 mapping; 0.75 = auto. Some drivers
+        # use 1=manual/3=auto instead, so we try both.
+        for auto_val in (0.25, 1):
+            try:
+                self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, auto_val)
+            except Exception:
+                pass
+        ok = False
+        try:
+            ok = self.cap.set(cv2.CAP_PROP_EXPOSURE, float(value))
+        except Exception:
+            ok = False
+        return ok
+
+    def set_gain(self, value):
+        if not self.cap:
+            return False
+        try:
+            return self.cap.set(cv2.CAP_PROP_GAIN, float(value))
+        except Exception:
+            return False
+
+    def get_exposure(self):
+        if not self.cap:
+            return None
+        try:
+            return self.cap.get(cv2.CAP_PROP_EXPOSURE)
+        except Exception:
+            return None
+
     def describe(self) -> str:
         if not self.cap:
             return "not open"

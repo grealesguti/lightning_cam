@@ -207,6 +207,153 @@ class AppState:
             self.sensor = None
 
     # ---- status snapshot for the UI --------------------------------------
+    def list_events(self):
+        """
+        List saved events on the output drive, newest first, with their key
+        stats from the JSON sidecars. Used by the GUI event gallery.
+        """
+        ev_dir = self.events_dir
+        # if not recording, try to resolve from settings/USB so the gallery
+        # works any time
+        if not ev_dir:
+            out = self.settings.get("output", "")
+            if not out:
+                usb = find_usb_mounts()
+                if usb:
+                    out = os.path.join(usb[0]["mount"], "lightning_events")
+            if out:
+                ev_dir = os.path.join(out, "events")
+        if not ev_dir or not os.path.isdir(ev_dir):
+            return []
+        out = []
+        try:
+            sidecars = [f for f in os.listdir(ev_dir)
+                        if f.startswith("event_") and f.endswith(".json")]
+            for f in sorted(sidecars, reverse=True)[:50]:
+                try:
+                    with open(os.path.join(ev_dir, f)) as fh:
+                        d = json.load(fh)
+                    out.append({
+                        "id": d.get("event_id"),
+                        "time": d.get("trigger_time"),
+                        "fps": d.get("measured_fps"),
+                        "frames": d.get("n_frames"),
+                        "kind": d.get("sensor", {}).get("kind"),
+                        "distance_km": d.get("sensor", {}).get("distance_km"),
+                        "saved_as": d.get("saved_as"),
+                    })
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return out
+
+    def event_image(self, event_id, which="bright"):
+        """
+        Return a JPEG of one frame from an event. which='bright' picks the
+        brightest frame (where a strike would be); 'first'/'last' or an integer
+        index also work. Reads .npy stacks or png/jpg frame folders.
+        """
+        if not _HAVE_CV2 or not event_id:
+            return None
+        ev_dir = self.events_dir
+        if not ev_dir:
+            out = self.settings.get("output", "")
+            if not out:
+                usb = find_usb_mounts()
+                if usb:
+                    out = os.path.join(usb[0]["mount"], "lightning_events")
+            if out:
+                ev_dir = os.path.join(out, "events")
+        if not ev_dir:
+            return None
+        try:
+            import numpy as np
+            base = os.path.join(ev_dir, f"event_{event_id}")
+            frames = None
+            if os.path.exists(base + ".npy"):
+                frames = np.load(base + ".npy")
+            elif os.path.isdir(base + "_frames"):
+                import glob
+                files = sorted(glob.glob(os.path.join(base + "_frames", "*")))
+                frames = [cv2.imread(f, cv2.IMREAD_GRAYSCALE) for f in files]
+            if frames is None or len(frames) == 0:
+                return None
+
+            n = len(frames)
+            if which == "bright":
+                # pick the frame with the highest 99th-percentile brightness
+                p99 = [float(np.percentile(frames[i], 99)) for i in range(n)]
+                idx = int(max(range(n), key=lambda i: p99[i]))
+            elif which == "first":
+                idx = 0
+            elif which == "last":
+                idx = n - 1
+            else:
+                try:
+                    idx = max(0, min(n - 1, int(which)))
+                except Exception:
+                    idx = 0
+            img = frames[idx]
+            # annotate with the frame index + brightness so dark frames are
+            # obvious in the gallery
+            vis = img.copy()
+            mx = int(img.max()); mn = int(img.mean())
+            cv2.putText(vis, f"frame {idx}/{n-1} max={mx} mean={mn}",
+                        (5, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, 255, 1)
+            ok, jpg = cv2.imencode(".jpg", vis, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            return jpg.tobytes() if ok else None
+        except Exception:
+            return None
+
+    def test_sensor(self):
+        """
+        Run a quick sensor diagnostic and return a result dict for the GUI.
+        Reads key registers and reports whether the AS3935 is responding. Does
+        NOT need a storm. If the recorder currently owns the sensor, reports
+        that instead of fighting for the bus.
+        """
+        if self.recording:
+            return {"ok": False,
+                    "msg": "Recorder is running and owns the sensor. Stop "
+                           "recording to run the bus test."}
+        if self.sensor is None:
+            # try to bring it up for the test
+            started = self.start_sensor()
+            if not started or self.sensor is None:
+                return {"ok": False,
+                        "msg": "Sensor could not be started. Check bus/wiring "
+                               "and that lgpio + spidev are installed."}
+        s = self.sensor
+        try:
+            r00 = s._read_reg(0x00)
+            r01 = s._read_reg(0x01)
+            r03 = s._read_reg(0x03)
+            r07 = s._read_reg(0x07)
+        except Exception as e:
+            return {"ok": False, "msg": f"Register read failed: {e}"}
+
+        responding = r00 not in (0x00, 0xFF)
+        regs = f"0x00=0x{r00:02X} 0x01=0x{r01:02X} 0x03=0x{r03:02X} 0x07=0x{r07:02X}"
+        counts = dict(self.sensor_counts)
+        total = sum(counts.values())
+
+        if not responding:
+            return {"ok": False,
+                    "msg": "AS3935 NOT responding on the bus (register 0x00 "
+                           f"read back 0x{r00:02X}). Check the SI strap "
+                           "(SPI=high), CS pin, 3.3V power, and solder joints.",
+                    "registers": regs}
+        return {"ok": True,
+                "msg": f"Sensor OK, responding on the bus. Registers: {regs}. "
+                       f"Events seen so far: {total} "
+                       f"(L{counts.get('lightning',0)} "
+                       f"D{counts.get('disturber',0)} "
+                       f"N{counts.get('noise',0)}). "
+                       "Click a piezo lighter near the antenna to test the IRQ "
+                       "path — it should register a disturber.",
+                "registers": regs}
+
     def last_event(self):
         """
         Return stats from the most recent event's JSON sidecar, or None.
@@ -428,6 +575,8 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
    <div class="kv"><span>Lightning</span><b id="c_light">0</b></div>
    <div class="kv"><span>Disturber</span><b id="c_dist">0</b></div>
    <div class="kv"><span>Noise</span><b id="c_noise">0</b></div>
+   <button class="ghost" onclick="testSensor(event)">Test sensor</button>
+   <div id="sensorresult" class="muted" style="margin-top:6px"></div>
    <div class="muted" style="margin-top:6px">Recent events</div>
    <table id="evtbl"><thead><tr><th>time</th><th>type</th><th>km</th><th>energy</th></tr></thead>
      <tbody></tbody></table>
@@ -499,6 +648,13 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
    <button class="ghost" onclick="refreshUsb()">Rescan USB</button>
  </div>
 
+ <div class="card" style="flex:2 1 480px">
+   <h2>Saved events on USB <span class="muted">(brightest frame — where a strike would show)</span></h2>
+   <button class="ghost" onclick="loadEvents(event)">Refresh events</button>
+   <div id="eventgallery" style="display:flex;flex-wrap:wrap;gap:10px;margin-top:10px"></div>
+   <div id="ev_none" class="muted">No events loaded — click Refresh.</div>
+ </div>
+
  <div class="card">
    <h2>Control</h2>
    <button onclick="save(event)">Apply settings</button>
@@ -558,6 +714,42 @@ async function stopRec(ev){
     const r=await fetch("/api/stop",{method:"POST"}); const j=await r.json();
     flash(btn,"Stopped ✓",true);
   }catch(e){ flash(btn,"Error ✗",false); }
+}
+async function loadEvents(ev){
+  const btn=ev&&ev.target;
+  if(btn){btn.textContent="Loading...";btn.disabled=true;}
+  try{
+    const r=await fetch("/api/events"); const j=await r.json();
+    const g=$("eventgallery"); const none=$("ev_none");
+    if(!j.events||!j.events.length){ g.innerHTML=""; none.style.display="block";
+      none.textContent="No events found on the drive."; }
+    else{
+      none.style.display="none";
+      g.innerHTML=j.events.map(e=>{
+        const t=(e.time||"").replace("T"," ");
+        return `<div style="width:220px;background:#0f1115;border:1px solid #262c38;
+          border-radius:8px;padding:6px">
+          <img src="/api/event-image?id=${encodeURIComponent(e.id)}&frame=bright"
+            style="width:100%;border-radius:5px;background:#000" loading="lazy">
+          <div style="font-size:12px;margin-top:4px">${t}</div>
+          <div class="muted">${e.kind||"?"} ${e.distance_km!=null?e.distance_km+"km":""}
+            · ${e.fps||"?"}fps · ${e.frames||"?"}f</div>
+        </div>`;
+      }).join("");
+    }
+  }catch(e){ $("ev_none").textContent="Error loading events: "+e; }
+  if(btn){btn.textContent="Refresh events";btn.disabled=false;}
+}
+async function testSensor(ev){
+  const btn=ev&&ev.target; const out=$("sensorresult");
+  if(btn){ btn.textContent="Testing..."; btn.disabled=true; }
+  out.textContent="";
+  try{
+    const r=await fetch("/api/test-sensor",{method:"POST"}); const j=await r.json();
+    out.innerHTML=`<span class="diag ${j.ok?'':'error'}" style="display:block">`+
+      `${j.ok?'✓':'⛔'} ${j.msg}</span>`;
+  }catch(e){ out.textContent="Test error: "+e; }
+  if(btn){ btn.textContent="Test sensor"; btn.disabled=false; }
 }
 async function saveQuiet(){
   try{
@@ -693,6 +885,18 @@ class Handler(BaseHTTPRequestHandler):
             usb = [{"mount": u["mount"], "free": human_bytes(u["free"])}
                    for u in find_usb_mounts()]
             self._send(200, json.dumps({"usb": usb}), "application/json")
+        elif p == "/api/events":
+            self._send(200, json.dumps({"events": self.state.list_events()}),
+                       "application/json")
+        elif p == "/api/event-image":
+            q = parse_qs(urlparse(self.path).query)
+            eid = q.get("id", [""])[0]
+            frame = q.get("frame", ["bright"])[0]
+            jpg = self.state.event_image(eid, frame)
+            if jpg:
+                self._send(200, jpg, "image/jpeg")
+            else:
+                self._send(404, b"no image", "text/plain")
         else:
             self._send(404, b"not found", "text/plain")
 
@@ -713,6 +917,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps(res), "application/json")
         elif p == "/api/stop":
             res = self.recorder.stop()
+            self._send(200, json.dumps(res), "application/json")
+        elif p == "/api/test-sensor":
+            res = self.state.test_sensor()
             self._send(200, json.dumps(res), "application/json")
         elif p == "/api/detach":
             # signal the main loop to shut down the web server but leave the

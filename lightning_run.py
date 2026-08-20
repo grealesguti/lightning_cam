@@ -134,27 +134,18 @@ class LightningRecorder:
         self._log_usb_state()
 
     def _apply_camera_controls(self):
-        """Set manual exposure/gain via v4l2-ctl (stable brightness for motion)."""
-        import subprocess
+        """Set manual exposure/gain via the camera object (OpenCV props) so the
+        writes actually take effect while streaming."""
         a = self.args
-        dev = a.device
-        def setctrl(name, val):
-            try:
-                subprocess.run(["v4l2-ctl", "-d", dev, "--set-ctrl", f"{name}={val}"],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                               timeout=3)
-            except Exception as e:
-                self.log.warning("Could not set %s=%s: %s", name, val, e)
-        if not getattr(a, "auto_exposure", False):
-            setctrl("exposure_auto", 1)
-            setctrl("auto_exposure", 1)
         if getattr(a, "exposure", None) is not None:
-            setctrl("exposure_time_absolute", a.exposure)
-            setctrl("exposure_absolute", a.exposure)
-            self.log.info("Camera exposure set to %d (manual).", a.exposure)
+            ok = self.cam.set_exposure(a.exposure)
+            self._cur_exposure = a.exposure
+            self.log.info("Camera exposure set to %d (%s).", a.exposure,
+                          "applied" if ok else "write rejected")
         if getattr(a, "gain", None) is not None:
-            setctrl("gain", a.gain)
-            self.log.info("Camera gain set to %d.", a.gain)
+            ok = self.cam.set_gain(a.gain)
+            self.log.info("Camera gain set to %d (%s).", a.gain,
+                          "applied" if ok else "write rejected")
 
     def _log_usb_state(self):
         usb = find_usb_mounts()
@@ -258,16 +249,13 @@ class LightningRecorder:
         new_exp = int(max(1, min(2000, round(self._cur_exposure * factor))))
         old = self._cur_exposure
         self._cur_exposure = new_exp
-        for name in ("exposure_time_absolute", "exposure_absolute"):
-            try:
-                subprocess.run(["v4l2-ctl", "-d", self.args.device,
-                                "--set-ctrl", f"{name}={new_exp}"],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                               timeout=3)
-            except Exception:
-                pass
-        self.log.info("recalibrate: sky=%.1f target=%d -> exposure %d->%d",
-                      measured, target, old, new_exp)
+        # apply LIVE via the camera object (OpenCV prop) -- reliable while
+        # streaming, unlike an external v4l2-ctl call which the driver ignores
+        # once OpenCV owns the device (this was why night snapshots stayed dark).
+        applied = self.cam.set_exposure(new_exp)
+        self.log.info("recalibrate: sky=%.1f target=%d -> exposure %d->%d (%s)",
+                      measured, target, old, new_exp,
+                      "applied" if applied else "WRITE REJECTED by driver")
 
     def _save_snapshot(self, frame):
         """Save a single current frame + a tiny sidecar (sensor/power now)."""
